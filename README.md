@@ -161,7 +161,7 @@ shell-cmd-rs -e ./src "gcc -c %1 -o /tmp/%b.o" ".*\.c$"
 
 ## How It Works
 
-The program recursively walks the specified directory using Rust's `std::fs`. For each file whose path matches the given regex (via the `regex` crate), it substitutes placeholders in the command template and executes it via `fork`/`execv` through `/bin/sh`. Hidden files and directories are skipped by default.
+The program recursively walks the specified directory using Rust's `std::fs`. For each file whose path matches the given regex (via the `regex` crate), it substitutes placeholders in the command template and executes it via `fork`/`execv` through `/bin/bash`. Hidden files and directories are skipped by default.
 
 Command execution uses the `nix` crate for POSIX `fork`, `execv`, `waitpid`, and signal management — matching the behavior of the original C++ implementation's custom `System()` function.
 

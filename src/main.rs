@@ -564,8 +564,8 @@ fn system_cmd(command: &str) -> i32 {
         error!("command contains null byte");
         process::exit(1);
     });
-    let c_sh = CString::new("/bin/sh").unwrap();
-    let c_sh_arg = CString::new("sh").unwrap();
+    let c_sh = CString::new("/bin/bash").unwrap();
+    let c_sh_arg = CString::new("bash").unwrap();
     let c_c = CString::new("-c").unwrap();
 
     // Block SIGCHLD
@@ -754,8 +754,8 @@ fn proc_cmd(cmd: &str, text: &[String], opts: &Options, stats: &mut Stats) -> bo
         }
         match unsafe { nix::unistd::fork() } {
             Ok(nix::unistd::ForkResult::Child) => {
-                let c_sh = CString::new("/bin/sh").unwrap();
-                let c_sh_arg = CString::new("sh").unwrap();
+                let c_sh = CString::new("/bin/bash").unwrap();
+                let c_sh_arg = CString::new("bash").unwrap();
                 let c_c = CString::new("-c").unwrap();
                 let c_cmd = CString::new(r.as_str()).unwrap();
                 nix::unistd::execv(
