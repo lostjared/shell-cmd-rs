@@ -638,7 +638,13 @@ fn system_cmd(command: &str) -> i32 {
             match nix::sys::wait::waitpid(child, None) {
                 Ok(ws) => match ws {
                     nix::sys::wait::WaitStatus::Exited(_, code) => break code,
-                    nix::sys::wait::WaitStatus::Signaled(_, _, _) => break -1,
+                    nix::sys::wait::WaitStatus::Signaled(_, sig, _) => {
+                        // If the child was killed by SIGINT, flag the parent to exit cleanly
+                        if sig == nix::sys::signal::Signal::SIGINT {
+                            INTERRUPTED.store(true, Ordering::SeqCst);
+                        }
+                        break -1;
+                    }
                     _ => break -1,
                 },
                 Err(nix::errno::Errno::EINTR) => continue,
@@ -762,6 +768,9 @@ fn proc_cmd(cmd: &str, text: &[String], opts: &Options, stats: &mut Stats) -> bo
 
     let ret = system_cmd(&r);
     stats.commands_run += 1;
+    if INTERRUPTED.load(Ordering::SeqCst) {
+        return false;
+    }
     if ret != 0 {
         stats.commands_failed += 1;
         if opts.stop_on_error {
