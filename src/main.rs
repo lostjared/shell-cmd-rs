@@ -579,14 +579,19 @@ fn system_cmd(command: &str) -> i32 {
     )
     .is_ok();
 
-    // Ignore SIGINT and SIGQUIT in parent
+    // Use our sigint_handler instead of SIG_IGN so Ctrl+C is recorded
+    let sa_int_handler = nix::sys::signal::SigAction::new(
+        nix::sys::signal::SigHandler::Handler(sigint_handler),
+        nix::sys::signal::SaFlags::empty(),
+        nix::sys::signal::SigSet::empty(),
+    );
     let sa_ignore = nix::sys::signal::SigAction::new(
         nix::sys::signal::SigHandler::SigIgn,
         nix::sys::signal::SaFlags::empty(),
         nix::sys::signal::SigSet::empty(),
     );
     let old_sigint =
-        unsafe { nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGINT, &sa_ignore) }.ok();
+        unsafe { nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGINT, &sa_int_handler) }.ok();
     let old_sigquit =
         unsafe { nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGQUIT, &sa_ignore) }.ok();
 
@@ -637,9 +642,15 @@ fn system_cmd(command: &str) -> i32 {
         Ok(nix::unistd::ForkResult::Parent { child }) => loop {
             match nix::sys::wait::waitpid(child, None) {
                 Ok(ws) => match ws {
-                    nix::sys::wait::WaitStatus::Exited(_, code) => break code,
+                    nix::sys::wait::WaitStatus::Exited(_, code) => {
+                        // Shell catches SIGINT and exits with 130 (128+2)
+                        if code == 130 {
+                            INTERRUPTED.store(true, Ordering::SeqCst);
+                        }
+                        break code;
+                    }
                     nix::sys::wait::WaitStatus::Signaled(_, sig, _) => {
-                        // If the child was killed by SIGINT, flag the parent to exit cleanly
+                        // If the child was killed directly by SIGINT
                         if sig == nix::sys::signal::Signal::SIGINT {
                             INTERRUPTED.store(true, Ordering::SeqCst);
                         }
