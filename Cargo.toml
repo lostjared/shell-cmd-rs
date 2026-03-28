@@ -1,0 +1,16 @@
+[package]
+name = "shell-cmd-rs"
+version = "1.2.0"
+edition = "2021"
+description = "Recursively find files matching a regex and execute a shell command for each match"
+license = "GPL-3.0"
+
+[[bin]]
+name = "shell-cmd-rs"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+nix = { version = "0.29", features = ["signal", "process", "fs"] }
+libc = "0.2"
