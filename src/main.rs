@@ -240,7 +240,6 @@ struct Cli {
     jobs: i32,
 
     /// Positional args: path "command" regex [extra_args..]
-    #[arg(trailing_var_arg = true)]
     args: Vec<String>,
 }
 
