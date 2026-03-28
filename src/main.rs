@@ -76,6 +76,10 @@ macro_rules! error {
 /// only written once and read from a single thread (parallel children don't read it).
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Global flag set to `true` when SIGINT (Ctrl+C) is received.
+/// Checked alongside `STOP_REQUESTED` to halt processing and exit cleanly.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
 /// Global pool of outstanding child process PIDs, used only in parallel mode
 /// (`-j N` where N > 1). Protected by a `Mutex` since we access it from the
 /// main thread only (no actual concurrent access, but the Mutex satisfies Rust's
@@ -836,7 +840,7 @@ fn add_directory(
         return;
     }
     // If a command previously failed and --stop-on-error was set, bail out.
-    if STOP_REQUESTED.load(Ordering::SeqCst) {
+    if STOP_REQUESTED.load(Ordering::SeqCst) || INTERRUPTED.load(Ordering::SeqCst) {
         return;
     }
 
@@ -854,7 +858,7 @@ fn add_directory(
     };
 
     for entry in entries {
-        if STOP_REQUESTED.load(Ordering::SeqCst) {
+        if STOP_REQUESTED.load(Ordering::SeqCst) || INTERRUPTED.load(Ordering::SeqCst) {
             return;
         }
         let entry = match entry {
@@ -950,6 +954,11 @@ fn add_directory(
     }
 }
 
+/// SIGINT handler — sets the INTERRUPTED flag for clean exit.
+extern "C" fn sigint_handler(_sig: libc::c_int) {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
 /// Program entry point.
 ///
 /// Parses command-line arguments via `clap`, validates positional arguments
@@ -1005,6 +1014,16 @@ fn print_help() {
 }
 
 fn main() {
+    // Install SIGINT handler for clean Ctrl+C exit
+    unsafe {
+        let sa = nix::sys::signal::SigAction::new(
+            nix::sys::signal::SigHandler::Handler(sigint_handler),
+            nix::sys::signal::SaFlags::empty(),
+            nix::sys::signal::SigSet::empty(),
+        );
+        let _ = nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGINT, &sa);
+    }
+
     // If no arguments provided, print colored help and exit (matches C++ behavior)
     if std::env::args().len() == 1 {
         print_help();
@@ -1119,6 +1138,52 @@ fn main() {
 
     if opts.jobs > 1 {
         wait_all(&mut stats);
+    }
+
+    if INTERRUPTED.load(Ordering::SeqCst) {
+        // Kill outstanding child processes
+        {
+            let pids = CHILD_PIDS.lock().unwrap();
+            for &pid in pids.iter() {
+                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+            }
+        }
+        // Wait for them to finish
+        loop {
+            if CHILD_PIDS.lock().unwrap().is_empty() {
+                break;
+            }
+            match nix::sys::wait::wait() {
+                Ok(ws) => {
+                    let pid = match ws {
+                        nix::sys::wait::WaitStatus::Exited(pid, _) => pid,
+                        nix::sys::wait::WaitStatus::Signaled(pid, _, _) => pid,
+                        _ => continue,
+                    };
+                    CHILD_PIDS.lock().unwrap().retain(|&p| p != pid);
+                }
+                Err(_) => break,
+            }
+        }
+        eprintln!("\nInterrupted.");
+        let co = use_color(2);
+        if stats.commands_run > 0 || stats.commands_failed > 0 {
+            if co {
+                eprintln!(
+                    "\x1b[1mSummary:\x1b[0m \x1b[1;32m{}\x1b[0m matched, \x1b[1;33m{}\x1b[0m run, {}{}\x1b[0m failed",
+                    stats.files_matched,
+                    stats.commands_run,
+                    if stats.commands_failed > 0 { "\x1b[1;31m" } else { "\x1b[1;32m" },
+                    stats.commands_failed
+                );
+            } else {
+                eprintln!(
+                    "Summary: {} matched, {} run, {} failed",
+                    stats.files_matched, stats.commands_run, stats.commands_failed
+                );
+            }
+        }
+        process::exit(130);
     }
 
     if opts.verbose || opts.dry_run || stats.commands_failed > 0 {
