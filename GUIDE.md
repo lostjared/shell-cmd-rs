@@ -19,7 +19,7 @@ Think of it as a more ergonomic alternative to chaining `find` with `-exec` — 
 4. For each file whose full path matches the regex:
    a. Apply metadata filters (size, time, permissions, ownership, type)
    b. Substitute placeholders in the command template
-   c. Fork a child process and execute the command via /bin/bash
+   c. Fork a child process and execute the command via the configured shell (/bin/bash by default)
 5. Print summary statistics to stderr
 ```
 
@@ -69,7 +69,7 @@ Commands are executed through a custom `system_cmd()` function that mirrors the 
 2. **Ignores `SIGINT`/`SIGQUIT`** in the parent via `sigaction()` so Ctrl+C doesn't kill the batch runner.
 3. **Forks** a child process via `nix::unistd::fork()`.
 4. **Restores default signal handlers** in the child process.
-5. Runs the command via `execv("/bin/bash", ["bash", "-c", command])` in the child.
+5. Runs the command via `execv("/bin/bash", ["bash", "-c", command])` in the child (or the shell specified by `--shell`).
 6. **Waits** for the child via `waitpid()`, handling `EINTR` retries.
 7. **Restores** signal masks and handlers in the parent after the child exits.
 
@@ -149,6 +149,7 @@ shell-cmd-rs [options] <path> "<command %1 [%2 %3..]>" <regex> [extra_args..]
 | `-e` | `--stop-on-error` | **Stop on error** — halt on first command failure |
 | `-c` | `--confirm` | **Confirm** — prompt yes/no before each command |
 | `-j N` | `--jobs N` | **Parallel** — run N commands concurrently (default: 1) |
+| `-w SHELL` | `--shell SHELL` | **Shell** — shell to use for execution (default: `/bin/bash`) |
 | `-h` | `--help` | **Help** — show usage information |
 | `-V` | `--version` | **Version** — print version number |
 

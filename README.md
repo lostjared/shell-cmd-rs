@@ -53,6 +53,7 @@ shell-cmd-rs [options] path "command %1 [%2 %3..]" regex [extra_args..]
 | `-e` | `--stop-on-error` | Stop on first command failure |
 | `-c` | `--confirm` | Prompt for confirmation before each command |
 | `-j N` | `--jobs N` | Run N commands in parallel (default: 1) |
+| `-w SHELL` | `--shell SHELL` | Shell to use for execution (default: `/bin/bash`) |
 | `-h` | `--help` | Show help |
 
 ## Examples
@@ -161,7 +162,7 @@ shell-cmd-rs -e ./src "gcc -c %1 -o /tmp/%b.o" ".*\.c$"
 
 ## How It Works
 
-The program recursively walks the specified directory using Rust's `std::fs`. For each file whose path matches the given regex (via the `regex` crate), it substitutes placeholders in the command template and executes it via `fork`/`execv` through `/bin/bash`. Hidden files and directories are skipped by default.
+The program recursively walks the specified directory using Rust's `std::fs`. For each file whose path matches the given regex (via the `regex` crate), it substitutes placeholders in the command template and executes it via `fork`/`execv` through the configured shell (`/bin/bash` by default). Hidden files and directories are skipped by default.
 
 Command execution uses the `nix` crate for POSIX `fork`, `execv`, `waitpid`, and signal management — matching the behavior of the original C++ implementation's custom `System()` function.
 

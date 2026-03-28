@@ -243,6 +243,10 @@ struct Cli {
     #[arg(short = 'j', long = "jobs", default_value = "1")]
     jobs: i32,
 
+    /// Shell to use for execution (default: /bin/bash)
+    #[arg(short = 'w', long = "shell", default_value = "/bin/bash")]
+    shell: String,
+
     /// Positional args: path "command" regex [extra_args..]
     args: Vec<String>,
 }
@@ -281,6 +285,10 @@ struct Options {
     confirm: bool,
     /// Number of parallel child processes (1 = sequential, >1 = fork pool).
     jobs: i32,
+    /// Shell path to use for command execution (default: /bin/bash).
+    shell: String,
+    /// Shell argv[0] name (derived from shell path).
+    shell_name: String,
 }
 
 /// Parse a size filter string into a [`SizeFilter`].
@@ -555,17 +563,17 @@ fn replace_all(orig: &str, from: &str, to: &str) -> String {
 }
 
 /// Execute a shell command via fork/exec with proper signal handling (mirrors the C++ System()).
-fn system_cmd(command: &str) -> i32 {
+fn system_cmd(command: &str, opts: &Options) -> i32 {
     if command.is_empty() {
-        return if system_cmd(":") == 0 { 1 } else { 0 };
+        return if system_cmd(":", opts) == 0 { 1 } else { 0 };
     }
 
     let c_command = CString::new(command).unwrap_or_else(|_| {
         error!("command contains null byte");
         process::exit(1);
     });
-    let c_sh = CString::new("/bin/bash").unwrap();
-    let c_sh_arg = CString::new("bash").unwrap();
+    let c_sh = CString::new(opts.shell.as_str()).unwrap();
+    let c_sh_arg = CString::new(opts.shell_name.as_str()).unwrap();
     let c_c = CString::new("-c").unwrap();
 
     // Block SIGCHLD
@@ -754,8 +762,8 @@ fn proc_cmd(cmd: &str, text: &[String], opts: &Options, stats: &mut Stats) -> bo
         }
         match unsafe { nix::unistd::fork() } {
             Ok(nix::unistd::ForkResult::Child) => {
-                let c_sh = CString::new("/bin/bash").unwrap();
-                let c_sh_arg = CString::new("bash").unwrap();
+                let c_sh = CString::new(opts.shell.as_str()).unwrap();
+                let c_sh_arg = CString::new(opts.shell_name.as_str()).unwrap();
                 let c_c = CString::new("-c").unwrap();
                 let c_cmd = CString::new(r.as_str()).unwrap();
                 nix::unistd::execv(
@@ -777,7 +785,7 @@ fn proc_cmd(cmd: &str, text: &[String], opts: &Options, stats: &mut Stats) -> bo
         return true;
     }
 
-    let ret = system_cmd(&r);
+    let ret = system_cmd(&r, opts);
     stats.commands_run += 1;
     if INTERRUPTED.load(Ordering::SeqCst) {
         return false;
@@ -1028,6 +1036,7 @@ fn print_help() {
   {g}-e, --stop-on-error{r} stop on first command failure
   {g}-c, --confirm{r}       prompt for confirmation before each command
   {g}-j, --jobs N{r}        run N commands in parallel (default: 1)
+  {g}-w, --shell SHELL{r}   shell to use for execution (default: /bin/bash)
   {g}-h, --help{r}          show this help",
         b=b, bw=bw, bc=bc, by=by, g=g, r=r
     );
@@ -1094,6 +1103,8 @@ fn main() {
         stop_on_error: cli.stop_on_error,
         confirm: cli.confirm,
         jobs: cli.jobs.max(1),
+        shell_name: cli.shell.rsplit('/').next().unwrap_or(&cli.shell).to_string(),
+        shell: cli.shell,
     };
 
     let positional = &cli.args;
