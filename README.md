@@ -1,7 +1,7 @@
 # shell-cmd-rs
 
 Recursively find files matching a regex pattern and execute a shell command for each match.
-Drop-in replacement for [shell-cmd](../shell-cmd/), rewritten in Rust.
+Drop-in replacement for [shell-cmd](https://github.com/lostjared/shell-cmd/), rewritten in Rust.
 
 ## Build
 
