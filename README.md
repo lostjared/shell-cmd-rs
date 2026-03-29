@@ -53,6 +53,7 @@ shell-cmd-rs [options] path "command %1 [%2 %3..]" regex [extra_args..]
 | `-g GROUP` | `--group GROUP` | Filter by group name |
 | `-t TYPE` | `--type TYPE` | Filter by type: `f` (file), `d` (directory), `l` (symlink) |
 | `-x REGEX` | `--exclude REGEX` | Exclude files/directories matching REGEX |
+| `-i` | `--glob-exclude` | Treat exclude pattern as a glob instead of regex |
 | `-e` | `--stop-on-error` | Stop on first command failure |
 | `-c` | `--confirm` | Prompt for confirmation before each command |
 | `-j N` | `--jobs N` | Run N commands in parallel (default: 1) |
@@ -142,7 +143,13 @@ shell-cmd-rs --glob . "echo %1" "*.rs"
 Glob with exclude:
 
 ```bash
-shell-cmd-rs --glob -x "*.o" . "echo %1" "*.c"
+shell-cmd-rs --glob -x "*.o" --glob-exclude . "echo %1" "*.c"
+```
+
+Exclude with regex (no `--glob-exclude` needed):
+
+```bash
+shell-cmd-rs -x "build|CMakeFiles" --glob . "echo %1" "*.rs"
 ```
 
 Use regex-match mode (entire path must match the pattern):

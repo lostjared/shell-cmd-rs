@@ -22,7 +22,8 @@
 //!   `%e` (extension), `%2+` (extra args); in `--list-all` mode `%0` expands to
 //!   all matched paths joined by spaces
 //! - Metadata filters: size, modification time, permissions, owner, group, type
-//! - Exclude patterns, dry-run, verbose, confirm mode, stop-on-error
+//! - Exclude patterns (regex by default, or glob via `-i`/`--glob-exclude`),
+//!   dry-run, verbose, confirm mode, stop-on-error
 //! - Parallel execution via `fork`/`execv` with proper signal handling
 //! - List-all mode (`-l`/`--list-all`): collect all matches and run the command
 //!   once with `%0` expanded to the full list of matched paths
@@ -281,6 +282,10 @@ struct Cli {
     /// Use regex-match (entire path must match) instead of regex-search (substring match)
     #[arg(short = 'z', long = "regex-match")]
     regex_match: bool,
+
+    /// Treat exclude pattern as a glob (*, ?) instead of regex
+    #[arg(short = 'i', long = "glob-exclude")]
+    glob_exclude: bool,
 }
 
 /// Aggregated runtime options parsed from CLI arguments.
@@ -328,6 +333,9 @@ struct Options {
     /// If true (via `-z`/`--regex-match`), the regex must match the **entire**
     /// path (anchored with `^(?:...)$`) rather than just a substring.
     regex_match: bool,
+    /// If true (via `-i`/`--glob-exclude`), treat the exclude pattern as a glob
+    /// instead of regex.
+    glob_exclude: bool,
 }
 
 /// Convert a glob pattern to an equivalent regex string.
@@ -335,26 +343,66 @@ struct Options {
 /// Escapes regex-special characters and translates glob wildcards:
 /// - `*` becomes `.*`
 /// - `?` becomes `.`
+/// - `[...]` character classes are passed through (with `!` or `^` mapped to `^`)
 /// - All other regex metacharacters are escaped with a backslash.
+/// - The result is anchored with `^...$`.
 ///
 /// # Examples
 ///
-/// - `"*.cpp"` → `".*\.cpp"`
-/// - `"test?"` → `"test."`
-/// - `"*cmake"` → `".*cmake"`
+/// - `"*.cpp"` → `"^.*\.cpp$"`
+/// - `"test?"` → `"^test.$"`
+/// - `"*cmake"` → `"^.*cmake$"`
+/// - `"[!a-z]*"` → `"^[^a-z].*$"`
+///
+/// Used by `--glob` to convert the search pattern and by `--glob-exclude` (`-i`)
+/// to convert the exclude pattern.
 fn glob_to_regex(glob: &str) -> String {
-    let mut result = String::new();
-    for c in glob.chars() {
+    let mut result = String::from('^');
+    let chars: Vec<char> = glob.chars().collect();
+    let mut i = 0;
+    let mut in_class = false;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        if in_class {
+            if c == ']' {
+                in_class = false;
+                result.push(']');
+            } else if c == '\\' {
+                result.push_str("\\\\");
+            } else {
+                result.push(c);
+            }
+            i += 1;
+            continue;
+        }
+
         match c {
             '*' => result.push_str(".*"),
             '?' => result.push('.'),
-            '.' | '\\' | '+' | '^' | '$' | '|' | '(' | ')' | '[' | ']' | '{' | '}' => {
+            '[' => {
+                in_class = true;
+                result.push('[');
+                if i + 1 < chars.len() && (chars[i + 1] == '!' || chars[i + 1] == '^') {
+                    result.push('^');
+                    i += 1;
+                }
+            }
+            '.' | '\\' | '+' | '^' | '$' | '|' | '(' | ')' | '{' | '}' => {
                 result.push('\\');
                 result.push(c);
             }
             _ => result.push(c),
         }
+        i += 1;
     }
+
+    if in_class {
+        result.push('\\');
+    }
+
+    result.push('$');
     result
 }
 
@@ -1265,6 +1313,7 @@ fn print_help() {
   {g}-g, --group GROUP{r}   filter by group name
   {g}-t, --type TYPE{r}     filter by type: f (file), d (directory), l (symlink)
   {g}-x, --exclude REGEX{r} exclude files/directories matching REGEX
+  {g}-i, --glob-exclude{r}  treat exclude pattern as a glob instead of regex
   {g}-e, --stop-on-error{r} stop on first command failure
   {g}-c, --confirm{r}       prompt for confirmation before each command
   {g}-j, --jobs N{r}        run N commands in parallel (default: 1)
@@ -1362,6 +1411,7 @@ fn main() {
         collect_all: cli.list_all,
         glob: cli.glob,
         regex_match: cli.regex_match,
+        glob_exclude: cli.glob_exclude,
     };
 
     let positional = &cli.args;
@@ -1393,7 +1443,7 @@ fn main() {
         process::exit(1);
     });
 
-    let exclude_pattern = if opts.glob && !opts.exclude_pattern.is_empty() {
+    let exclude_pattern = if opts.glob_exclude && !opts.exclude_pattern.is_empty() {
         glob_to_regex(&opts.exclude_pattern)
     } else {
         opts.exclude_pattern.clone()

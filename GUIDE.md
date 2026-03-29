@@ -155,6 +155,7 @@ shell-cmd-rs [options] <path> "<command %1 [%2 %3..]>" <regex> [extra_args..]
 | `-g GROUP` | `--group GROUP` | **Group** — filter by group name |
 | `-t TYPE` | `--type TYPE` | **Type** — `f` (file), `d` (directory), `l` (symlink) |
 | `-x REGEX` | `--exclude REGEX` | **Exclude** — skip files/directories matching the regex |
+| `-i` | `--glob-exclude` | **Glob exclude** — treat the exclude pattern as a glob instead of regex |
 | `-e` | `--stop-on-error` | **Stop on error** — halt on first command failure |
 | `-c` | `--confirm` | **Confirm** — prompt yes/no before each command |
 | `-j N` | `--jobs N` | **Parallel** — run N commands concurrently (default: 1) |
@@ -360,10 +361,16 @@ Use `--glob` / `-b` to write familiar wildcard patterns instead of regex. `*` ma
 shell-cmd-rs --glob . "echo %1" "*.rs"
 ```
 
-Glob also applies to `--exclude`:
+Glob also applies to `--exclude` when combined with `--glob-exclude` / `-i`:
 
 ```bash
-shell-cmd-rs --glob -x "*.o" . "echo %1" "*.c"
+shell-cmd-rs --glob -x "*.o" --glob-exclude . "echo %1" "*.c"
+```
+
+Without `--glob-exclude`, the `-x` pattern is always treated as a regex:
+
+```bash
+shell-cmd-rs --glob -x "build|CMakeFiles" . "echo %1" "*.rs"
 ```
 
 ### 25. Regex Match Mode
