@@ -287,7 +287,6 @@ struct Options {
     jobs: i32,
     /// Shell path to use for command execution (default: /bin/bash).
     shell: String,
-    /// Shell argv[0] name (derived from shell path).
     shell_name: String,
 }
 
@@ -340,13 +339,10 @@ fn parse_size_filter(s: &str) -> SizeFilter {
 
     // Parse the numeric portion and multiply by the suffix multiplier.
     // Exit with an error if the number cannot be parsed.
-    let bytes = num_str
-        .parse::<u64>()
-        .unwrap_or_else(|_| {
-            error!("invalid size value '{s}'");
-            process::exit(1);
-        })
-        * multiplier;
+    let bytes = num_str.parse::<u64>().unwrap_or_else(|_| {
+        error!("invalid size value '{s}'");
+        process::exit(1);
+    }) * multiplier;
 
     SizeFilter {
         active: true,
@@ -599,7 +595,8 @@ fn system_cmd(command: &str, opts: &Options) -> i32 {
         nix::sys::signal::SigSet::empty(),
     );
     let old_sigint =
-        unsafe { nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGINT, &sa_int_handler) }.ok();
+        unsafe { nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGINT, &sa_int_handler) }
+            .ok();
     let old_sigquit =
         unsafe { nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGQUIT, &sa_ignore) }.ok();
 
@@ -727,12 +724,14 @@ fn proc_cmd(cmd: &str, text: &[String], opts: &Options, stats: &mut Stats) -> bo
 
     if opts.confirm {
         let co = use_color(1);
-        print!("{}Execute:{} {} {}[y/N]{} ",
+        print!(
+            "{}Execute:{} {} {}[y/N]{} ",
             if co { "\x1b[1;33m" } else { "" },
             if co { "\x1b[0m" } else { "" },
             r,
             if co { "\x1b[1m" } else { "" },
-            if co { "\x1b[0m" } else { "" });
+            if co { "\x1b[0m" } else { "" }
+        );
         io::stdout().flush().ok();
         let mut answer = String::new();
         io::stdin().lock().read_line(&mut answer).ok();
@@ -876,11 +875,7 @@ fn add_directory(
     let entries = match fs::read_dir(path) {
         Ok(e) => e,
         Err(e) => {
-            error!(
-                "could not open directory: {}: {}",
-                path.display(),
-                e
-            );
+            error!("could not open directory: {}: {}", path.display(), e);
             process::exit(1);
         }
     };
@@ -960,9 +955,7 @@ fn add_directory(
             );
         } else if is_symlink && opts.type_filter == 'l' {
             let fullpath = entry.path().to_string_lossy().to_string();
-            if regex.is_match(&fullpath)
-                && matches_filters(&entry.path(), &symlink_meta, opts)
-            {
+            if regex.is_match(&fullpath) && matches_filters(&entry.path(), &symlink_meta, opts) {
                 stats.files_matched += 1;
                 args[0] = fullpath;
                 if !proc_cmd(cmd, args, opts, stats) {
@@ -1002,11 +995,19 @@ extern "C" fn sigint_handler(_sig: libc::c_int) {
 fn print_help() {
     let co = use_color(1);
     let (b, bw, bc, by, g, r) = if co {
-        ("\x1b[1m", "\x1b[1;37m", "\x1b[1;36m", "\x1b[1;33m", "\x1b[32m", "\x1b[0m")
+        (
+            "\x1b[1m",
+            "\x1b[1;37m",
+            "\x1b[1;36m",
+            "\x1b[1;33m",
+            "\x1b[32m",
+            "\x1b[0m",
+        )
     } else {
         ("", "", "", "", "", "")
     };
-    println!("\
+    println!(
+        "\
 {b}usage:{r} {bw}shell-cmd-rs{r} [options] path \"command %1 [%2 %3..]\" regex [extra_args..]
 
 {bw}Recursively find files matching regex and run command for each.{r}
@@ -1038,7 +1039,12 @@ fn print_help() {
   {g}-j, --jobs N{r}        run N commands in parallel (default: 1)
   {g}-w, --shell SHELL{r}   shell to use for execution (default: /bin/bash)
   {g}-h, --help{r}          show this help",
-        b=b, bw=bw, bc=bc, by=by, g=g, r=r
+        b = b,
+        bw = bw,
+        bc = bc,
+        by = by,
+        g = g,
+        r = r
     );
 }
 
@@ -1103,7 +1109,12 @@ fn main() {
         stop_on_error: cli.stop_on_error,
         confirm: cli.confirm,
         jobs: cli.jobs.max(1),
-        shell_name: cli.shell.rsplit('/').next().unwrap_or(&cli.shell).to_string(),
+        shell_name: cli
+            .shell
+            .rsplit('/')
+            .next()
+            .unwrap_or(&cli.shell)
+            .to_string(),
         shell: cli.shell,
     };
 
@@ -1125,10 +1136,7 @@ fn main() {
 
     let exclude_regex = if !opts.exclude_pattern.is_empty() {
         Some(Regex::new(&opts.exclude_pattern).unwrap_or_else(|e| {
-            error!(
-                "invalid exclude regex '{}': {}",
-                opts.exclude_pattern, e
-            );
+            error!("invalid exclude regex '{}': {}", opts.exclude_pattern, e);
             process::exit(1);
         }))
     } else {
