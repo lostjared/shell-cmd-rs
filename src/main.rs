@@ -1,6 +1,6 @@
 //! # shell-cmd-rs
 //!
-//! **shell-cmd-rs v1.2** — Recursively find files matching a regex and execute a
+//! **shell-cmd-rs v1.3** — Recursively find files matching a regex and execute a
 //! shell command for each match.
 //!
 //! This is a drop-in replacement for the C++20 `shell-cmd` utility, rewritten
@@ -18,6 +18,9 @@
 //!     path (anchored with `^(?:...)$`)
 //! - Glob mode (`-b`/`--glob`): use familiar wildcard patterns (`*`, `?`)
 //!   instead of regex — special characters are auto-escaped
+//! - Expression filter (`-f`/`--expr`): compose `glob()`, `regex()`,
+//!   `regex_search()`, and `regex_match()` predicates with boolean operators
+//!   `and`, `or`, `not`, and parentheses
 //! - Placeholder substitution: `%0` (filename), `%1` (full path), `%b` (stem),
 //!   `%e` (extension), `%2+` (extra args); in `--list-all` mode `%0` expands to
 //!   all matched paths joined by spaces
@@ -189,7 +192,7 @@ struct Stats {
 #[derive(Parser)]
 #[command(
     name = "shell-cmd-rs",
-    version = "1.2.0",
+    version = "1.3.0",
     about = "Recursively find files matching regex and run command for each.",
     after_help = "\
 placeholders:
@@ -205,7 +208,11 @@ regex modes:
 
 glob mode:
   -b          treat pattern as a glob (*, ?) instead of regex
-              special regex characters are auto-escaped"
+              special regex characters are auto-escaped
+
+expr mode:
+  -f EXPR     compose glob(), regex(), regex_match() with and/or/not
+              e.g. --expr '(glob(\"*.cpp\") or glob(\"*.hpp\")) and not regex(\"build\")'"
 )]
 struct Cli {
     /// Dry-run, print commands without executing
@@ -286,6 +293,10 @@ struct Cli {
     /// Treat exclude pattern as a glob (*, ?) instead of regex
     #[arg(short = 'i', long = "glob-exclude")]
     glob_exclude: bool,
+
+    /// Expression filter: compose glob(), regex(), regex_match() with and/or/not
+    #[arg(short = 'f', long = "expr")]
+    expr: Option<String>,
 }
 
 /// Aggregated runtime options parsed from CLI arguments.
@@ -336,6 +347,8 @@ struct Options {
     /// If true (via `-i`/`--glob-exclude`), treat the exclude pattern as a glob
     /// instead of regex.
     glob_exclude: bool,
+    /// Expression filter string from `--expr`.
+    expr_str: String,
 }
 
 /// Convert a glob pattern to an equivalent regex string.
@@ -404,6 +417,312 @@ fn glob_to_regex(glob: &str) -> String {
 
     result.push('$');
     result
+}
+
+// --- Expression filter (--expr) ------------------------------------------------
+
+/// Node types for the expression filter AST.
+enum ExprType {
+    Glob,
+    RegexSearch,
+    RegexMatch,
+    And,
+    Or,
+    Not,
+}
+
+/// AST node for expression-based file matching.
+struct ExprNode {
+    node_type: ExprType,
+    /// Pre-compiled regex (leaf nodes only).
+    compiled: Option<Regex>,
+    /// Left child (AND/OR) or sole child (NOT).
+    left: Option<Box<ExprNode>>,
+    /// Right child (AND/OR only).
+    right: Option<Box<ExprNode>>,
+}
+
+impl ExprNode {
+    /// Evaluate this expression node against a file path.
+    fn evaluate(&self, path: &str) -> bool {
+        match self.node_type {
+            ExprType::Glob | ExprType::RegexSearch => {
+                self.compiled.as_ref().map_or(false, |re| re.is_match(path))
+            }
+            ExprType::RegexMatch => self
+                .compiled
+                .as_ref()
+                .map_or(false, |re| re.is_match(path)),
+            ExprType::And => {
+                self.left.as_ref().map_or(false, |l| l.evaluate(path))
+                    && self.right.as_ref().map_or(false, |r| r.evaluate(path))
+            }
+            ExprType::Or => {
+                self.left.as_ref().map_or(false, |l| l.evaluate(path))
+                    || self.right.as_ref().map_or(false, |r| r.evaluate(path))
+            }
+            ExprType::Not => !self.left.as_ref().map_or(false, |l| l.evaluate(path)),
+        }
+    }
+}
+
+/// Token produced by the expression tokenizer.
+#[derive(Debug, Clone, PartialEq)]
+enum ExprTokenType {
+    Ident,
+    StringLit,
+    LParen,
+    RParen,
+    End,
+}
+
+#[derive(Debug, Clone)]
+struct ExprToken {
+    token_type: ExprTokenType,
+    value: String,
+}
+
+/// Tokenizer for expression filter strings.
+struct ExprTokenizer {
+    chars: Vec<char>,
+    pos: usize,
+}
+
+impl ExprTokenizer {
+    fn new(src: &str) -> Self {
+        Self {
+            chars: src.chars().collect(),
+            pos: 0,
+        }
+    }
+
+    fn skip_ws(&mut self) {
+        while self.pos < self.chars.len() && self.chars[self.pos].is_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    fn next_token(&mut self) -> ExprToken {
+        self.skip_ws();
+        if self.pos >= self.chars.len() {
+            return ExprToken {
+                token_type: ExprTokenType::End,
+                value: String::new(),
+            };
+        }
+        let c = self.chars[self.pos];
+        if c == '(' {
+            self.pos += 1;
+            return ExprToken {
+                token_type: ExprTokenType::LParen,
+                value: "(".to_string(),
+            };
+        }
+        if c == ')' {
+            self.pos += 1;
+            return ExprToken {
+                token_type: ExprTokenType::RParen,
+                value: ")".to_string(),
+            };
+        }
+        if c == '"' || c == '\'' {
+            let q = c;
+            self.pos += 1;
+            let mut val = String::new();
+            while self.pos < self.chars.len() && self.chars[self.pos] != q {
+                if self.chars[self.pos] == '\\' && self.pos + 1 < self.chars.len() {
+                    self.pos += 1;
+                    val.push(self.chars[self.pos]);
+                } else {
+                    val.push(self.chars[self.pos]);
+                }
+                self.pos += 1;
+            }
+            if self.pos < self.chars.len() {
+                self.pos += 1;
+            }
+            return ExprToken {
+                token_type: ExprTokenType::StringLit,
+                value: val,
+            };
+        }
+        if c.is_alphabetic() || c == '_' {
+            let mut val = String::new();
+            while self.pos < self.chars.len()
+                && (self.chars[self.pos].is_alphanumeric() || self.chars[self.pos] == '_')
+            {
+                val.push(self.chars[self.pos]);
+                self.pos += 1;
+            }
+            return ExprToken {
+                token_type: ExprTokenType::Ident,
+                value: val,
+            };
+        }
+        error!(
+            "unexpected character '{}' in expression at position {}",
+            c, self.pos
+        );
+        process::exit(1);
+    }
+}
+
+/// Recursive-descent parser for expression filter strings.
+///
+/// Grammar:
+///   expr     := or_expr
+///   or_expr  := and_expr ("or" and_expr)*
+///   and_expr := not_expr ("and" not_expr)*
+///   not_expr := "not" not_expr | primary
+///   primary  := function "(" STRING ")" | "(" expr ")"
+///   function := "glob" | "regex" | "regex_search" | "regex_match"
+struct ExprParser {
+    tok: ExprTokenizer,
+    cur: ExprToken,
+}
+
+impl ExprParser {
+    fn new(src: &str) -> Self {
+        let mut tok = ExprTokenizer::new(src);
+        let cur = tok.next_token();
+        Self { tok, cur }
+    }
+
+    fn advance(&mut self) {
+        self.cur = self.tok.next_token();
+    }
+
+    fn expect(&mut self, t: ExprTokenType, desc: &str) {
+        if self.cur.token_type != t {
+            let got = if self.cur.value.is_empty() {
+                "end"
+            } else {
+                &self.cur.value
+            };
+            error!("expected {} in expression, got '{}'", desc, got);
+            process::exit(1);
+        }
+        self.advance();
+    }
+
+    fn parse_primary(&mut self) -> Box<ExprNode> {
+        if self.cur.token_type == ExprTokenType::LParen {
+            self.advance();
+            let node = self.parse_or();
+            self.expect(ExprTokenType::RParen, "')'");
+            return node;
+        }
+        if self.cur.token_type != ExprTokenType::Ident {
+            let got = if self.cur.value.is_empty() {
+                "end"
+            } else {
+                &self.cur.value
+            };
+            error!("unexpected token '{}' in expression", got);
+            process::exit(1);
+        }
+        let name = self.cur.value.clone();
+        let ft = match name.as_str() {
+            "glob" => ExprType::Glob,
+            "regex" | "regex_search" => ExprType::RegexSearch,
+            "regex_match" => ExprType::RegexMatch,
+            _ => {
+                error!("unknown function '{}' in expression", name);
+                process::exit(1);
+            }
+        };
+        self.advance();
+        self.expect(ExprTokenType::LParen, "'(' after function name");
+        if self.cur.token_type != ExprTokenType::StringLit {
+            error!("expected quoted string as function argument");
+            process::exit(1);
+        }
+        let pattern = self.cur.value.clone();
+        self.advance();
+        self.expect(ExprTokenType::RParen, "')'");
+
+        let regex_pattern = match ft {
+            ExprType::Glob => glob_to_regex(&pattern),
+            ExprType::RegexMatch => format!("^(?:{})$", pattern),
+            _ => pattern.clone(),
+        };
+        let compiled = Regex::new(&regex_pattern).unwrap_or_else(|e| {
+            error!("invalid regex '{}' in expression: {}", pattern, e);
+            process::exit(1);
+        });
+
+        Box::new(ExprNode {
+            node_type: ft,
+            compiled: Some(compiled),
+            left: None,
+            right: None,
+        })
+    }
+
+    fn parse_not(&mut self) -> Box<ExprNode> {
+        if self.cur.token_type == ExprTokenType::Ident && self.cur.value == "not" {
+            self.advance();
+            let child = self.parse_not();
+            return Box::new(ExprNode {
+                node_type: ExprType::Not,
+                compiled: None,
+                left: Some(child),
+                right: None,
+            });
+        }
+        self.parse_primary()
+    }
+
+    fn parse_and(&mut self) -> Box<ExprNode> {
+        let mut left = self.parse_not();
+        while self.cur.token_type == ExprTokenType::Ident && self.cur.value == "and" {
+            self.advance();
+            let right = self.parse_not();
+            left = Box::new(ExprNode {
+                node_type: ExprType::And,
+                compiled: None,
+                left: Some(left),
+                right: Some(right),
+            });
+        }
+        left
+    }
+
+    fn parse_or(&mut self) -> Box<ExprNode> {
+        let mut left = self.parse_and();
+        while self.cur.token_type == ExprTokenType::Ident && self.cur.value == "or" {
+            self.advance();
+            let right = self.parse_and();
+            left = Box::new(ExprNode {
+                node_type: ExprType::Or,
+                compiled: None,
+                left: Some(left),
+                right: Some(right),
+            });
+        }
+        left
+    }
+
+    fn parse(mut self) -> Box<ExprNode> {
+        let root = self.parse_or();
+        if self.cur.token_type != ExprTokenType::End {
+            error!("unexpected content after expression");
+            process::exit(1);
+        }
+        root
+    }
+}
+
+/// Check whether a path matches the active search pattern or expression.
+fn entry_matches_path(
+    fullpath: &str,
+    regex: &Regex,
+    expr_root: Option<&ExprNode>,
+) -> bool {
+    if let Some(root) = expr_root {
+        return root.evaluate(fullpath);
+    }
+    regex.is_match(fullpath)
 }
 
 /// Parse a size filter string into a [`SizeFilter`].
@@ -1024,6 +1343,7 @@ fn wait_all(stats: &mut Stats) {
 /// - `path` — the directory to scan
 /// - `regex` — compiled regex matched against each entry's full path
 /// - `exclude_regex` — optional compiled exclude pattern
+/// - `expr_root` — optional parsed expression tree (from `--expr`)
 /// - `opts` — runtime options (depth, hidden, filters, etc.)
 /// - `stats` — mutable execution statistics (files_matched is incremented)
 /// - `files` — accumulator for matched file paths
@@ -1032,6 +1352,7 @@ fn fill_list(
     path: &Path,
     regex: &Regex,
     exclude_regex: Option<&Regex>,
+    expr_root: Option<&ExprNode>,
     opts: &Options,
     stats: &mut Stats,
     files: &mut Vec<String>,
@@ -1096,7 +1417,7 @@ fn fill_list(
         if is_dir && !is_symlink {
             if opts.type_filter == 'd' {
                 let fullpath = entry.path().to_string_lossy().to_string();
-                if regex.is_match(&fullpath) && matches_filters(&entry.path(), &meta, opts) {
+                if entry_matches_path(&fullpath, regex, expr_root) && matches_filters(&entry.path(), &meta, opts) {
                     stats.files_matched += 1;
                     files.push(fullpath);
                 }
@@ -1105,6 +1426,7 @@ fn fill_list(
                 &entry.path(),
                 regex,
                 exclude_regex,
+                expr_root,
                 opts,
                 stats,
                 files,
@@ -1112,13 +1434,13 @@ fn fill_list(
             );
         } else if is_symlink && opts.type_filter == 'l' {
             let fullpath = entry.path().to_string_lossy().to_string();
-            if regex.is_match(&fullpath) && matches_filters(&entry.path(), &symlink_meta, opts) {
+            if entry_matches_path(&fullpath, regex, expr_root) && matches_filters(&entry.path(), &symlink_meta, opts) {
                 stats.files_matched += 1;
                 files.push(fullpath);
             }
         } else if is_file || (is_symlink && opts.type_filter == '\0') {
             let fullpath = entry.path().to_string_lossy().to_string();
-            if regex.is_match(&fullpath) && matches_filters(&entry.path(), &meta, opts) {
+            if entry_matches_path(&fullpath, regex, expr_root) && matches_filters(&entry.path(), &meta, opts) {
                 stats.files_matched += 1;
                 files.push(fullpath);
             }
@@ -1131,6 +1453,7 @@ fn add_directory(
     cmd: &str,
     regex: &Regex,
     exclude_regex: Option<&Regex>,
+    expr_root: Option<&ExprNode>,
     args: &mut Vec<String>,
     opts: &Options,
     stats: &mut Stats,
@@ -1209,7 +1532,7 @@ fn add_directory(
             // If type filter is 'd', also match directories against regex
             if opts.type_filter == 'd' {
                 let fullpath = entry.path().to_string_lossy().to_string();
-                if regex.is_match(&fullpath) && matches_filters(&entry.path(), &meta, opts) {
+                if entry_matches_path(&fullpath, regex, expr_root) && matches_filters(&entry.path(), &meta, opts) {
                     stats.files_matched += 1;
                     args[0] = fullpath;
                     if !proc_cmd(cmd, args, None, opts, stats) {
@@ -1222,6 +1545,7 @@ fn add_directory(
                 cmd,
                 regex,
                 exclude_regex,
+                expr_root,
                 args,
                 opts,
                 stats,
@@ -1229,7 +1553,7 @@ fn add_directory(
             );
         } else if is_symlink && opts.type_filter == 'l' {
             let fullpath = entry.path().to_string_lossy().to_string();
-            if regex.is_match(&fullpath) && matches_filters(&entry.path(), &symlink_meta, opts) {
+            if entry_matches_path(&fullpath, regex, expr_root) && matches_filters(&entry.path(), &symlink_meta, opts) {
                 stats.files_matched += 1;
                 args[0] = fullpath;
                 if !proc_cmd(cmd, args, None, opts, stats) {
@@ -1238,7 +1562,7 @@ fn add_directory(
             }
         } else if is_file || (is_symlink && opts.type_filter == '\0') {
             let fullpath = entry.path().to_string_lossy().to_string();
-            if regex.is_match(&fullpath) && matches_filters(&entry.path(), &meta, opts) {
+            if entry_matches_path(&fullpath, regex, expr_root) && matches_filters(&entry.path(), &meta, opts) {
                 stats.files_matched += 1;
                 args[0] = fullpath;
                 if !proc_cmd(cmd, args, None, opts, stats) {
@@ -1320,6 +1644,8 @@ fn print_help() {
   {g}-w, --shell SHELL{r}   shell to use for execution (default: /bin/bash)
   {g}-b, --glob{r}          treat pattern as a glob (*, ?) instead of regex
   {g}-z, --regex-match{r}   use regex-match (full path must match) instead of search
+  {g}-f, --expr EXPR{r}     expression filter: compose glob(), regex(), regex_match()
+                      with and/or/not and parentheses
   {g}-h, --help{r}          show this help
 
 {by}regex modes:{r}
@@ -1330,7 +1656,13 @@ fn print_help() {
 {by}glob mode:{r}
   With {g}-b{r}/{g}--glob{r}, write familiar wildcard patterns instead of regex:
   {g}*{r} matches anything, {g}?{r} matches a single character, and regex-special
-  characters ({g}.{r}, {g}+{r}, {g}({r}, etc.) are auto-escaped.",
+  characters ({g}.{r}, {g}+{r}, {g}({r}, etc.) are auto-escaped.
+
+{by}expr mode:{r}
+  With {g}-f{r}/{g}--expr{r}, compose filter functions with boolean operators:
+  {g}glob(\"pattern\"){r}, {g}regex(\"pattern\"){r}, {g}regex_match(\"pattern\"){r}
+  combined with {g}and{r}, {g}or{r}, {g}not{r}, and parentheses.
+  When --expr is used, the regex positional argument is not required.",
         b = b,
         bw = bw,
         bc = bc,
@@ -1412,21 +1744,42 @@ fn main() {
         glob: cli.glob,
         regex_match: cli.regex_match,
         glob_exclude: cli.glob_exclude,
+        expr_str: cli.expr.clone().unwrap_or_default(),
+    };
+
+    // Parse expression filter if --expr was provided
+    let expr_root: Option<Box<ExprNode>> = if !opts.expr_str.is_empty() {
+        Some(ExprParser::new(&opts.expr_str).parse())
+    } else {
+        None
     };
 
     let positional = &cli.args;
-    if positional.len() < 3 {
-        error!("at least three positional arguments required.");
+    let min_args = if expr_root.is_some() { 2 } else { 3 };
+    if positional.len() < min_args {
+        if expr_root.is_some() {
+            error!("at least two positional arguments required when --expr is used.");
+        } else {
+            error!("at least three positional arguments required.");
+        }
         print_help();
         process::exit(1);
     }
 
     let path = PathBuf::from(&positional[0]);
     let input = &positional[1];
-    let regex_str = if opts.glob {
-        glob_to_regex(&positional[2])
+
+    // When --expr is used, the regex positional is optional.
+    // Use a dummy "match-nothing" regex as placeholder when no pattern is given.
+    let regex_str = if positional.len() >= 3 {
+        if opts.glob {
+            glob_to_regex(&positional[2])
+        } else {
+            positional[2].clone()
+        }
     } else {
-        positional[2].clone()
+        // --expr mode without regex arg: use match-everything pattern
+        ".*".to_string()
     };
 
     // In regex-match mode, anchor the pattern so it must match the entire path.
@@ -1467,13 +1820,14 @@ fn main() {
 
     // In --list-all mode, the placeholder index starts at 1 (no per-file %1)
     // and args does not include a "filename" placeholder entry.
+    let extra_start = if positional.len() >= 3 { 3 } else { 2 };
     let mut index: usize = if opts.collect_all { 1 } else { 2 };
     let mut args: Vec<String> = if opts.collect_all {
         Vec::new()
     } else {
         vec!["filename".to_string()]
     };
-    for i in 3..positional.len() {
+    for i in extra_start..positional.len() {
         let placeholder = format!("%{}", index);
         if !input.contains(&placeholder) {
             error!(
@@ -1500,6 +1854,7 @@ fn main() {
             &path,
             &regex,
             exclude_regex.as_ref(),
+            expr_root.as_deref(),
             &opts,
             &mut stats,
             &mut files,
@@ -1522,6 +1877,7 @@ fn main() {
         input,
         &regex,
         exclude_regex.as_ref(),
+        expr_root.as_deref(),
         &mut args,
         &opts,
         &mut stats,

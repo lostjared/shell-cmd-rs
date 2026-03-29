@@ -54,6 +54,7 @@ shell-cmd-rs [options] path "command %1 [%2 %3..]" regex [extra_args..]
 | `-t TYPE` | `--type TYPE` | Filter by type: `f` (file), `d` (directory), `l` (symlink) |
 | `-x REGEX` | `--exclude REGEX` | Exclude files/directories matching REGEX |
 | `-i` | `--glob-exclude` | Treat exclude pattern as a glob instead of regex |
+| `-f EXPR` | `--expr EXPR` | Expression filter — compose `glob()`, `regex()`, `regex_match()` with `and`/`or`/`not` (replaces the regex positional argument) |
 | `-e` | `--stop-on-error` | Stop on first command failure |
 | `-c` | `--confirm` | Prompt for confirmation before each command |
 | `-j N` | `--jobs N` | Run N commands in parallel (default: 1) |
@@ -168,6 +169,61 @@ shell-cmd-rs --glob -x "build|CMakeFiles|third_party" . "rustfmt %1" "*.rs"
 
 # Regex search pattern, glob exclude pattern (use -i)
 shell-cmd-rs -x "build*" -i . "echo %1" "\.rs$"
+```
+
+---
+
+## Expression Filter (`--expr`)
+
+The `-f` / `--expr` option lets you compose complex match logic in a single argument, combining `glob()`, `regex()`, and `regex_match()` with boolean operators. When `--expr` is used, the third positional argument (regex) is **not required** — the expression replaces it.
+
+### Grammar
+
+Expressions are built from **functions**, **boolean operators**, and **parentheses**:
+
+| Element | Description |
+|---------|-------------|
+| `glob("pattern")` | Convert the glob to an anchored regex and apply `regex_search` (same as `--glob`) |
+| `regex("pattern")` | Substring regex search (same as default mode) |
+| `regex_search("pattern")` | Alias for `regex()` |
+| `regex_match("pattern")` | Full-path regex match (same as `--regex-match`) |
+| `and` | Both sides must match |
+| `or` | Either side must match |
+| `not` | Negate the following expression |
+| `( … )` | Group sub-expressions to control precedence |
+
+Operator precedence (highest to lowest): `not`, `and`, `or`. Use parentheses to override.
+
+### Examples
+
+Match Rust and TOML files, exclude target directory:
+
+```bash
+shell-cmd-rs . "echo %1" --expr '(glob("*.rs") or glob("*.toml")) and not regex("target")'
+```
+
+Single function — equivalent to a regex positional argument:
+
+```bash
+shell-cmd-rs . "wc -l %1" --expr 'regex("\.py$")'
+```
+
+Nested boolean logic — Python or Rust sources, excluding tests and vendor:
+
+```bash
+shell-cmd-rs . "echo %1" --expr '(glob("*.py") or glob("*.rs")) and not glob("*test*") and not regex("vendor")'
+```
+
+Full-path matching inside an expression:
+
+```bash
+shell-cmd-rs . "echo %1" --expr 'regex_match("\\./src/.*\\.rs")'
+```
+
+Combine `--expr` with other options (`-x`, `--size`, `--type`):
+
+```bash
+shell-cmd-rs -x "node_modules" --size +1K --type f . "wc -l %1" --expr 'glob("*.ts") or glob("*.tsx")'
 ```
 
 ---
@@ -372,8 +428,9 @@ Command execution uses the `nix` crate for POSIX `fork`, `execv`, `waitpid`, and
 | **Filename placeholder** | `%0` gives the filename without the path | No equivalent — requires `sh -c` + `basename` |
 | **Full path placeholder** | `%1` | `{}` |
 | **Extra arguments** | `%2`, `%3`, … with validation | Not supported — use shell variables |
-| **Pattern matching** | Regex (substring or full-path with `-z`), glob mode (`-b`) | Glob (`-name`) or implementation-varying `-regex` |
+| **Pattern matching** | Rust `regex` crate on the full path; `--regex-match` for full-path anchoring; `--glob` for wildcard patterns; `--expr` for composable expressions | Glob (`-name`) or implementation-varying `-regex` |
 | **Exclude patterns** | Built-in `-x` with regex or glob (`-i`) | Requires negation logic or `! -name` |
+| **Expression filters** | Built-in `--expr` — combine `glob()`, `regex()`, `regex_match()` with `and`/`or`/`not` | Boolean `-and`/`-or`/`-not` between find predicates |
 | **Dry-run** | Built-in `-n` flag | No native support |
 | **Verbose mode** | Built-in `-v` flag | No native support |
 | **Filter by metadata** | Size (`-s`), time (`-m`), permissions (`-p`), owner (`-u`), group (`-g`), type (`-t`) | Size, time, permissions, ownership, type, boolean logic |
@@ -394,7 +451,7 @@ shell-cmd-rs . "cp %1 /tmp/backup/%0" "\.txt$"
 find . -regex '.*\.txt$' -exec sh -c 'cp "$1" "/tmp/backup/$(basename "$1")"' _ {} \;
 ```
 
-In short, `shell-cmd-rs` trades `find`'s boolean filter combinators for a more ergonomic command-templating experience with built-in dry-run, parallel execution, confirm mode, stop-on-error, exclude patterns (regex or glob), and summary statistics.
+In short, `shell-cmd-rs` offers a more ergonomic command-templating experience with built-in dry-run, parallel execution, confirm mode, stop-on-error, exclude patterns (regex or glob), composable expression filters (`--expr` with `and`/`or`/`not`), and summary statistics.
 
 ## Compatibility
 

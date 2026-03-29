@@ -17,6 +17,7 @@ Think of it as a more ergonomic alternative to chaining `find` with `-exec` — 
 2. Compile the regex pattern and optional exclude pattern
    - In --regex-match mode, anchor patterns with ^(?:...)$ for full-path matching
    - In --glob mode, convert wildcard patterns to regex first
+   - In --expr mode, parse the expression into an AST (regex arg is optional)
 3. If --list-all mode:
    a. Recursively walk the target directory, collecting all matching paths
    b. Join paths into a single string and invoke the command template once with %0 = all matches
@@ -37,10 +38,10 @@ Think of it as a more ergonomic alternative to chaining `find` with `-exec` — 
 |----------|---------|
 | 1st | **Path** — the root directory to search |
 | 2nd | **Command template** — shell command with `%` placeholders |
-| 3rd | **Regex** — pattern matched against the full file path |
+| 3rd | **Regex** — pattern matched against the full file path (optional when `--expr` is used) |
 | 4th+ | **Extra arguments** — substituted into `%2`, `%3`, etc. |
 
-If fewer than three positional arguments are given, the program prints an error and exits.
+If fewer than three positional arguments are given (and `--expr` is not set), the program prints an error and exits. When `--expr` is used, the regex argument is not required — only the path and command template are needed.
 
 ### Directory Traversal
 
@@ -51,7 +52,7 @@ The function `add_directory()` walks the directory tree using `std::fs::read_dir
 - **Permission errors** — directories that can't be opened produce an error message and exit.
 - **Symlinks** — symlink detection uses `symlink_metadata()` to avoid following symlinks when checking type. For non-symlink operations, `metadata()` (which follows symlinks) is used.
 
-For every entry whose full path matches the regex and passes all metadata filters, the program calls `proc_cmd()`.
+For every entry whose full path matches the regex (or satisfies the `--expr` expression) and passes all metadata filters, the program calls `proc_cmd()`.
 
 In **list-all mode** (`-l` / `--list-all`), a separate function `fill_list()` walks the tree and collects all matching paths into a vector instead of executing commands. After the walk completes, the paths are joined with spaces and `proc_cmd()` is called once with `%0` expanded to the full list.
 
@@ -156,6 +157,7 @@ shell-cmd-rs [options] <path> "<command %1 [%2 %3..]>" <regex> [extra_args..]
 | `-t TYPE` | `--type TYPE` | **Type** — `f` (file), `d` (directory), `l` (symlink) |
 | `-x REGEX` | `--exclude REGEX` | **Exclude** — skip files/directories matching the regex |
 | `-i` | `--glob-exclude` | **Glob exclude** — treat the exclude pattern as a glob instead of regex |
+| `-f EXPR` | `--expr EXPR` | **Expression filter** — compose `glob()`, `regex()`, `regex_match()` with `and`/`or`/`not` (replaces the regex positional argument) |
 | `-e` | `--stop-on-error` | **Stop on error** — halt on first command failure |
 | `-c` | `--confirm` | **Confirm** — prompt yes/no before each command |
 | `-j N` | `--jobs N` | **Parallel** — run N commands concurrently (default: 1) |
@@ -481,6 +483,59 @@ This collects all `.log` files larger than 1 KB and creates a single tar archive
 
 ---
 
+## New in v1.3
+
+### 32. Expression Filter (`--expr`)
+
+The `-f` / `--expr` option lets you compose complex match logic in a single argument, combining `glob()`, `regex()`, and `regex_match()` with boolean operators `and`, `or`, `not`, and parentheses. When `--expr` is used, the third positional argument (regex) is **not required**.
+
+**Grammar:**
+
+| Element | Description |
+|---------|-------------|
+| `glob("pattern")` | Convert the glob to an anchored regex and apply `regex_search` |
+| `regex("pattern")` | Substring regex search (default mode) |
+| `regex_search("pattern")` | Alias for `regex()` |
+| `regex_match("pattern")` | Full-path regex match |
+| `and` | Both sides must match |
+| `or` | Either side must match |
+| `not` | Negate the following expression |
+| `( … )` | Group sub-expressions |
+
+Operator precedence (highest to lowest): `not`, `and`, `or`. Use parentheses to override.
+
+Match Rust and TOML files, exclude target directory:
+
+```bash
+shell-cmd-rs . "echo %1" --expr '(glob("*.rs") or glob("*.toml")) and not regex("target")'
+```
+
+Single function — equivalent to a regex positional argument:
+
+```bash
+shell-cmd-rs . "wc -l %1" --expr 'regex("\.py$")'
+```
+
+Nested boolean logic:
+
+```bash
+shell-cmd-rs . "echo %1" --expr '(glob("*.py") or glob("*.rs")) and not glob("*test*") and not regex("vendor")'
+```
+
+Full-path matching inside an expression:
+
+```bash
+shell-cmd-rs . "echo %1" --expr 'regex_match("\\./src/.*\\.rs")'
+```
+
+Combine `--expr` with other options:
+
+```bash
+shell-cmd-rs -x "node_modules" --size +1K --type f . "wc -l %1" --expr 'glob("*.ts") or glob("*.tsx")'
+```
+
+---
+
 ## Placeholder Quick Reference
 
 | Placeholder | Value |
@@ -502,7 +557,9 @@ This collects all `.log` files larger than 1 KB and creates a single tar archive
 | **Filename placeholder** | `%0` gives the filename without the path | No equivalent — requires `sh -c` + `basename` |
 | **Full path placeholder** | `%1` | `{}` |
 | **Extra arguments** | `%2`, `%3`, … with validation | Not supported — use shell variables |
-| **Pattern matching** | Rust `regex` crate on the full path; `--regex-match` for full-path anchoring; `--glob` for wildcard patterns | Glob (`-name`) or implementation-varying `-regex` |
+| **Pattern matching** | Rust `regex` crate on the full path; `--regex-match` for full-path anchoring; `--glob` for wildcard patterns; `--expr` for composable expressions | Glob (`-name`) or implementation-varying `-regex` |
+| **Exclude patterns** | Built-in `-x` / `--exclude` with regex or glob (`-i`) | Requires negation logic or `! -name` |
+| **Expression filters** | Built-in `--expr` — combine `glob()`, `regex()`, `regex_match()` with `and`/`or`/`not` | Boolean `-and`/`-or`/`-not` between find predicates |
 | **Dry-run** | Built-in `-n` flag | No native support |
 | **Verbose mode** | Built-in `-v` flag | No native support |
 | **Filtering by metadata** | Size, time, permissions, owner, group, type | Size, time, permissions, ownership, type, boolean logic |
@@ -538,8 +595,8 @@ find . -regex '.*\.bak$' -exec echo rm {} \;
 
 ### When to Use Which
 
-- **Use `shell-cmd-rs`** when your command needs the filename separated from the path, when you want to inject extra arguments, or when you want built-in dry-run/verbose, parallel execution, confirm mode, exclude patterns, stop-on-error, and summary statistics.
-- **Use `find`** when you need boolean logic combining filters (`-and`, `-or`, `-not`) — or when you're on a system without a Rust toolchain.
+- **Use `shell-cmd-rs`** when your command needs the filename separated from the path, when you want to inject extra arguments, or when you want built-in dry-run/verbose, parallel execution, confirm mode, exclude patterns, stop-on-error, composable expression filters (`--expr`), and summary statistics.
+- **Use `find`** when you're on a system without a Rust toolchain.
 
 ---
 
