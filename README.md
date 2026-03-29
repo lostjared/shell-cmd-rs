@@ -39,6 +39,8 @@ shell-cmd-rs [options] path "command %1 [%2 %3..]" regex [extra_args..]
 
 | Short | Long | Description |
 |-------|------|-------------|
+| `-b` | `--glob` | Treat pattern as a glob (`*`, `?`) instead of regex |
+| `-z` | `--regex-match` | Use full-path matching (entire path must match the regex) instead of substring search |
 | `-n` | `--dry-run` | Dry-run — print commands without executing |
 | `-v` | `--verbose` | Verbose — print each command before running |
 | `-a` | `--all` | Include hidden files and directories |
@@ -131,6 +133,30 @@ Combine filters — large `.log` files modified recently:
 shell-cmd-rs /var/log "wc -l %1" ".*\.log$" -s +1M -m -7
 ```
 
+Use glob patterns instead of regex:
+
+```bash
+shell-cmd-rs --glob . "echo %1" "*.rs"
+```
+
+Glob with exclude:
+
+```bash
+shell-cmd-rs --glob -x "*.o" . "echo %1" "*.c"
+```
+
+Use regex-match mode (entire path must match the pattern):
+
+```bash
+shell-cmd-rs -z . "echo %1" ".*\.rs$"
+```
+
+Combine regex-match with glob:
+
+```bash
+shell-cmd-rs -z --glob . "echo %1" "*.rs"
+```
+
 Exclude `node_modules` and `.git` directories:
 
 ```bash
@@ -195,7 +221,7 @@ Command execution uses the `nix` crate for POSIX `fork`, `execv`, `waitpid`, and
 | **Filename placeholder** | `%0` gives the filename without the path | No equivalent — requires `sh -c` + `basename` |
 | **Full path placeholder** | `%1` | `{}` |
 | **Extra arguments** | `%2`, `%3`, … with validation | Not supported — use shell variables |
-| **Pattern matching** | Rust `regex` crate on the full path | Glob (`-name`) or implementation-varying `-regex` |
+| **Pattern matching** | Rust `regex` crate on the full path; `--regex-match` for full-path anchoring; `--glob` for wildcard patterns | Glob (`-name`) or implementation-varying `-regex` |
 | **Dry-run** | Built-in `-n` flag | No native support |
 | **Verbose mode** | Built-in `-v` flag | No native support |
 | **Filter by metadata** | Size, time, permissions, owner, group, type | Size, time, permissions, ownership, type, boolean logic |

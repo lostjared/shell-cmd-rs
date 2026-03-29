@@ -11,6 +11,13 @@
 //! ## Features
 //!
 //! - Regex-based file matching (via the `regex` crate)
+//! - Two regex modes:
+//!   - **regex-search** (default): matches if the pattern appears anywhere in the
+//!     full path (substring match via `Regex::is_match`)
+//!   - **regex-match** (`-z`/`--regex-match`): the pattern must match the **entire**
+//!     path (anchored with `^(?:...)$`)
+//! - Glob mode (`-b`/`--glob`): use familiar wildcard patterns (`*`, `?`)
+//!   instead of regex — special characters are auto-escaped
 //! - Placeholder substitution: `%0` (filename), `%1` (full path), `%b` (stem),
 //!   `%e` (extension), `%2+` (extra args); in `--list-all` mode `%0` expands to
 //!   all matched paths joined by spaces
@@ -189,7 +196,15 @@ placeholders:
   %1          full path to matched file
   %2+         extra arguments from command line
   %b          basename without extension
-  %e          file extension (including dot)"
+  %e          file extension (including dot)
+
+regex modes:
+  (default)   regex-search — pattern matches anywhere in the path
+  -z          regex-match  — pattern must match the entire path
+
+glob mode:
+  -b          treat pattern as a glob (*, ?) instead of regex
+              special regex characters are auto-escaped"
 )]
 struct Cli {
     /// Dry-run, print commands without executing
@@ -258,6 +273,14 @@ struct Cli {
 
     /// Positional args: path "command" regex [extra_args..]
     args: Vec<String>,
+
+    /// Treat pattern as a glob (*, ?) instead of regex
+    #[arg(short = 'b', long = "glob")]
+    glob: bool,
+
+    /// Use regex-match (entire path must match) instead of regex-search (substring match)
+    #[arg(short = 'z', long = "regex-match")]
+    regex_match: bool,
 }
 
 /// Aggregated runtime options parsed from CLI arguments.
@@ -300,6 +323,39 @@ struct Options {
     /// If true (via `-l`/`--list-all`), collect all matched file paths and run
     /// one command with `%0` expanded to the combined space-delimited list.
     collect_all: bool,
+    /// If true (via `-b`/`--glob`), treat patterns as globs instead of regex.
+    glob: bool,
+    /// If true (via `-z`/`--regex-match`), the regex must match the **entire**
+    /// path (anchored with `^(?:...)$`) rather than just a substring.
+    regex_match: bool,
+}
+
+/// Convert a glob pattern to an equivalent regex string.
+///
+/// Escapes regex-special characters and translates glob wildcards:
+/// - `*` becomes `.*`
+/// - `?` becomes `.`
+/// - All other regex metacharacters are escaped with a backslash.
+///
+/// # Examples
+///
+/// - `"*.cpp"` → `".*\.cpp"`
+/// - `"test?"` → `"test."`
+/// - `"*cmake"` → `".*cmake"`
+fn glob_to_regex(glob: &str) -> String {
+    let mut result = String::new();
+    for c in glob.chars() {
+        match c {
+            '*' => result.push_str(".*"),
+            '?' => result.push('.'),
+            '.' | '\\' | '+' | '^' | '$' | '|' | '(' | ')' | '[' | ']' | '{' | '}' => {
+                result.push('\\');
+                result.push(c);
+            }
+            _ => result.push(c),
+        }
+    }
+    result
 }
 
 /// Parse a size filter string into a [`SizeFilter`].
@@ -1153,10 +1209,11 @@ extern "C" fn sigint_handler(_sig: libc::c_int) {
 /// Program entry point.
 ///
 /// Parses command-line arguments via `clap`, validates positional arguments
-/// and placeholder consistency, constructs [`Options`], compiles regex patterns,
-/// runs the recursive directory traversal via [`add_directory()`] (or
-/// [`fill_list()`] in `--list-all` mode), waits for parallel children if
-/// applicable, and prints a summary.
+/// and placeholder consistency, constructs [`Options`], compiles regex patterns
+/// (anchoring with `^(?:...)$` when `--regex-match` is active), runs the
+/// recursive directory traversal via [`add_directory()`] (or [`fill_list()`]
+/// in `--list-all` mode), waits for parallel children if applicable, and prints
+/// a summary.
 ///
 /// # Exit codes
 ///
@@ -1212,7 +1269,19 @@ fn print_help() {
   {g}-c, --confirm{r}       prompt for confirmation before each command
   {g}-j, --jobs N{r}        run N commands in parallel (default: 1)
   {g}-w, --shell SHELL{r}   shell to use for execution (default: /bin/bash)
-  {g}-h, --help{r}          show this help",
+  {g}-b, --glob{r}          treat pattern as a glob (*, ?) instead of regex
+  {g}-z, --regex-match{r}   use regex-match (full path must match) instead of search
+  {g}-h, --help{r}          show this help
+
+{by}regex modes:{r}
+  By default, the regex is tested as a {g}substring search{r} (matches anywhere
+  in the path). With {g}-z{r}/{g}--regex-match{r}, the entire path must match the
+  pattern (equivalent to anchoring with ^...$).
+
+{by}glob mode:{r}
+  With {g}-b{r}/{g}--glob{r}, write familiar wildcard patterns instead of regex:
+  {g}*{r} matches anything, {g}?{r} matches a single character, and regex-special
+  characters ({g}.{r}, {g}+{r}, {g}({r}, etc.) are auto-escaped.",
         b = b,
         bw = bw,
         bc = bc,
@@ -1291,6 +1360,8 @@ fn main() {
             .to_string(),
         shell: cli.shell,
         collect_all: cli.list_all,
+        glob: cli.glob,
+        regex_match: cli.regex_match,
     };
 
     let positional = &cli.args;
@@ -1302,16 +1373,42 @@ fn main() {
 
     let path = PathBuf::from(&positional[0]);
     let input = &positional[1];
-    let regex_str = &positional[2];
+    let regex_str = if opts.glob {
+        glob_to_regex(&positional[2])
+    } else {
+        positional[2].clone()
+    };
 
-    let regex = Regex::new(regex_str).unwrap_or_else(|e| {
+    // In regex-match mode, anchor the pattern so it must match the entire path.
+    // Wrapping in ^(?:...)$ converts a substring search into a full-string match,
+    // equivalent to C++ std::regex_match vs std::regex_search.
+    let regex_str = if opts.regex_match {
+        format!("^(?:{})$", regex_str)
+    } else {
+        regex_str
+    };
+
+    let regex = Regex::new(&regex_str).unwrap_or_else(|e| {
         error!("invalid regex '{}': {}", regex_str, e);
         process::exit(1);
     });
 
-    let exclude_regex = if !opts.exclude_pattern.is_empty() {
-        Some(Regex::new(&opts.exclude_pattern).unwrap_or_else(|e| {
-            error!("invalid exclude regex '{}': {}", opts.exclude_pattern, e);
+    let exclude_pattern = if opts.glob && !opts.exclude_pattern.is_empty() {
+        glob_to_regex(&opts.exclude_pattern)
+    } else {
+        opts.exclude_pattern.clone()
+    };
+
+    // Anchor the exclude pattern in regex-match mode as well.
+    let exclude_pattern = if opts.regex_match && !exclude_pattern.is_empty() {
+        format!("^(?:{})$", exclude_pattern)
+    } else {
+        exclude_pattern
+    };
+
+    let exclude_regex = if !exclude_pattern.is_empty() {
+        Some(Regex::new(&exclude_pattern).unwrap_or_else(|e| {
+            error!("invalid exclude regex '{}': {}", exclude_pattern, e);
             process::exit(1);
         }))
     } else {

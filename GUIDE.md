@@ -15,6 +15,8 @@ Think of it as a more ergonomic alternative to chaining `find` with `-exec` — 
 ```
 1. Parse command-line options and positional arguments (via clap)
 2. Compile the regex pattern and optional exclude pattern
+   - In --regex-match mode, anchor patterns with ^(?:...)$ for full-path matching
+   - In --glob mode, convert wildcard patterns to regex first
 3. If --list-all mode:
    a. Recursively walk the target directory, collecting all matching paths
    b. Join paths into a single string and invoke the command template once with %0 = all matches
@@ -157,6 +159,8 @@ shell-cmd-rs [options] <path> "<command %1 [%2 %3..]>" <regex> [extra_args..]
 | `-c` | `--confirm` | **Confirm** — prompt yes/no before each command |
 | `-j N` | `--jobs N` | **Parallel** — run N commands concurrently (default: 1) |
 | `-w SHELL` | `--shell SHELL` | **Shell** — shell to use for execution (default: `/bin/bash`) |
+| `-b` | `--glob` | **Glob mode** — treat pattern as a glob (`*`, `?`) instead of regex |
+| `-z` | `--regex-match` | **Regex match** — entire path must match the regex (anchored with `^(?:...)$`) |
 | `-h` | `--help` | **Help** — show usage information |
 | `-V` | `--version` | **Version** — print version number |
 
@@ -348,7 +352,41 @@ Skip `node_modules` and `.git` directories when counting TypeScript lines:
 shell-cmd-rs -x "node_modules|\.git" . "wc -l %1" ".*\.ts$"
 ```
 
-### 24. Basename & Extension Placeholders
+### 24. Glob Mode
+
+Use `--glob` / `-b` to write familiar wildcard patterns instead of regex. `*` matches anything, `?` matches a single character, and special regex characters (`.`, `+`, `(`, etc.) are auto-escaped:
+
+```bash
+shell-cmd-rs --glob . "echo %1" "*.rs"
+```
+
+Glob also applies to `--exclude`:
+
+```bash
+shell-cmd-rs --glob -x "*.o" . "echo %1" "*.c"
+```
+
+### 25. Regex Match Mode
+
+By default, the regex is tested as a **substring search** — if the pattern appears anywhere in the full path, it matches. Use `-z` / `--regex-match` to require the **entire path** to match the pattern:
+
+```bash
+# Default (regex-search): matches any path containing ".rs"
+shell-cmd-rs . "echo %1" "\.rs"
+
+# Regex-match: the entire path must match the pattern
+shell-cmd-rs -z . "echo %1" ".*\.rs$"
+```
+
+This is equivalent to the C++ version’s `std::regex_match` vs `std::regex_search`. Under the hood, `--regex-match` wraps the pattern with `^(?:...)$`.
+
+Combine with `--glob` for anchored wildcard matching:
+
+```bash
+shell-cmd-rs -z --glob . "echo %1" "*.rs"
+```
+
+### 26. Basename & Extension Placeholders
 
 Convert WAV audio files to MP3, using `%b` to name the output file without the original extension:
 
@@ -362,7 +400,7 @@ Extract extensions to organize files by type:
 shell-cmd-rs -n . "mkdir -p /tmp/by-ext/%e && cp %1 /tmp/by-ext/%e/%0" ".*"
 ```
 
-### 25. Parallel Execution
+### 27. Parallel Execution
 
 Resize images using 4 parallel jobs:
 
@@ -370,7 +408,7 @@ Resize images using 4 parallel jobs:
 shell-cmd-rs -j 4 ./images "convert %1 -resize 800x600 /tmp/thumbs/%0" ".*\.jpg$"
 ```
 
-### 26. Confirm Mode
+### 28. Confirm Mode
 
 Interactively confirm before each destructive action:
 
@@ -384,7 +422,7 @@ Output:
 Execute: rm /tmp/old.bak ? [y/N]
 ```
 
-### 27. Stop on Error
+### 29. Stop on Error
 
 Compile all C files and stop at the first failure:
 
@@ -392,7 +430,7 @@ Compile all C files and stop at the first failure:
 shell-cmd-rs -e ./src "gcc -c %1 -o /tmp/%b.o" ".*\.c$"
 ```
 
-### 28. Summary Statistics
+### 30. Summary Statistics
 
 A summary line is automatically printed to stderr when verbose, dry-run, or any command failed:
 
@@ -404,7 +442,7 @@ shell-cmd-rs -v . "wc -l %1" ".*\.py$"
 Summary: 12 matched, 12 run, 0 failed
 ```
 
-### 29. List-All Mode
+### 31. List-All Mode
 
 Collect all matching file paths and pass them to a single command invocation:
 
@@ -457,7 +495,7 @@ This collects all `.log` files larger than 1 KB and creates a single tar archive
 | **Filename placeholder** | `%0` gives the filename without the path | No equivalent — requires `sh -c` + `basename` |
 | **Full path placeholder** | `%1` | `{}` |
 | **Extra arguments** | `%2`, `%3`, … with validation | Not supported — use shell variables |
-| **Pattern matching** | Rust `regex` crate on the full path | Glob (`-name`) or implementation-varying `-regex` |
+| **Pattern matching** | Rust `regex` crate on the full path; `--regex-match` for full-path anchoring; `--glob` for wildcard patterns | Glob (`-name`) or implementation-varying `-regex` |
 | **Dry-run** | Built-in `-n` flag | No native support |
 | **Verbose mode** | Built-in `-v` flag | No native support |
 | **Filtering by metadata** | Size, time, permissions, owner, group, type | Size, time, permissions, ownership, type, boolean logic |
@@ -520,7 +558,9 @@ find . -regex '.*\.bak$' -exec echo rm {} \;
 
 2. **Quote the command template.** Since it contains `%` placeholders and often shell metacharacters, always wrap it in double quotes: `"command %1"`.
 
-3. **Escape regex special characters.** To match a literal dot in file extensions, use `\.` — e.g., `".*\.rs$"` not `".*rs$"` (the latter also matches `ars`).
+3. **Escape regex special characters.** To match a literal dot in file extensions, use `\.` — e.g., `".*\.rs$"` not `".*rs$"` (the latter also matches `ars`). Alternatively, use `--glob` to avoid regex escaping altogether: `--glob "*.rs"`.
+
+4. **Understand the two regex modes.** By default, the regex matches anywhere in the path (substring search). Use `-z` / `--regex-match` when you need the entire path to match — this is stricter and requires patterns like `".*\.rs$"` instead of just `"\.rs"`.
 
 4. **Use `%0` for output filenames.** When copying/converting files to a new directory, `%0` gives you the original filename without the source path.
 
