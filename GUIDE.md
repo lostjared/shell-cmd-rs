@@ -15,11 +15,15 @@ Think of it as a more ergonomic alternative to chaining `find` with `-exec` — 
 ```
 1. Parse command-line options and positional arguments (via clap)
 2. Compile the regex pattern and optional exclude pattern
-3. Recursively walk the target directory
-4. For each file whose full path matches the regex:
-   a. Apply metadata filters (size, time, permissions, ownership, type)
-   b. Substitute placeholders in the command template
-   c. Fork a child process and execute the command via the configured shell (/bin/bash by default)
+3. If --list-all mode:
+   a. Recursively walk the target directory, collecting all matching paths
+   b. Join paths into a single string and invoke the command template once with %0 = all matches
+4. Otherwise (default per-file mode):
+   a. Recursively walk the target directory
+   b. For each file whose full path matches the regex:
+      i.  Apply metadata filters (size, time, permissions, ownership, type)
+      ii. Substitute placeholders in the command template
+      iii. Fork a child process and execute the command via the configured shell
 5. Print summary statistics to stderr
 ```
 
@@ -46,6 +50,8 @@ The function `add_directory()` walks the directory tree using `std::fs::read_dir
 - **Symlinks** — symlink detection uses `symlink_metadata()` to avoid following symlinks when checking type. For non-symlink operations, `metadata()` (which follows symlinks) is used.
 
 For every entry whose full path matches the regex and passes all metadata filters, the program calls `proc_cmd()`.
+
+In **list-all mode** (`-l` / `--list-all`), a separate function `fill_list()` walks the tree and collects all matching paths into a vector instead of executing commands. After the walk completes, the paths are joined with spaces and `proc_cmd()` is called once with `%0` expanded to the full list.
 
 ### Placeholder Substitution
 
@@ -138,6 +144,7 @@ shell-cmd-rs [options] <path> "<command %1 [%2 %3..]>" <regex> [extra_args..]
 | `-n` | `--dry-run` | **Dry-run** — print each command but don't execute it |
 | `-v` | `--verbose` | **Verbose** — print each command before executing it |
 | `-a` | `--all` | **All files** — include hidden files and directories |
+| `-l` | `--list-all` | **List all** — collect all matches and run command once with `%0` = all matched paths |
 | `-d N` | `--depth N` | **Max depth** — limit recursion (0 = current directory only) |
 | `-s SIZE` | `--size SIZE` | **Size filter** — `+10M` (>10 MB), `-1K` (<1 KB), `4096` (exact bytes). Suffixes: K, M, G |
 | `-m DAYS` | `--mtime DAYS` | **Modification time** — `+7` (older than 7 days), `-1` (within last day), `3` (exactly 3 days) |
@@ -397,13 +404,43 @@ shell-cmd-rs -v . "wc -l %1" ".*\.py$"
 Summary: 12 matched, 12 run, 0 failed
 ```
 
+### 29. List-All Mode
+
+Collect all matching file paths and pass them to a single command invocation:
+
+```bash
+shell-cmd-rs -l . "cat %0" ".*\.txt$"
+```
+
+This finds every `.txt` file recursively and runs `cat` once with all paths as arguments — equivalent to `cat file1.txt file2.txt file3.txt ...`.
+
+Dry-run to preview the combined command:
+
+```bash
+shell-cmd-rs -l -n . "wc -l %0" ".*\.rs$"
+```
+
+Output:
+
+```
+wc -l ./src/main.rs ./src/lib.rs ./src/utils.rs
+```
+
+Combine with other filters:
+
+```bash
+shell-cmd-rs -l -s +1K . "tar czf archive.tar.gz %0" ".*\.log$"
+```
+
+This collects all `.log` files larger than 1 KB and creates a single tar archive containing all of them.
+
 ---
 
 ## Placeholder Quick Reference
 
 | Placeholder | Value |
 |-------------|-------|
-| `%0` | Filename only (e.g., `report.txt`) |
+| `%0` | Filename only (e.g., `report.txt`); in `--list-all` mode, all matched paths |
 | `%1` | Full path (e.g., `/home/user/docs/report.txt`) |
 | `%b` | Basename without extension (e.g., `report`) |
 | `%e` | File extension with dot (e.g., `.txt`) |
@@ -426,6 +463,7 @@ Summary: 12 matched, 12 run, 0 failed
 | **Filtering by metadata** | Size, time, permissions, owner, group, type | Size, time, permissions, ownership, type, boolean logic |
 | **Exclude patterns** | Built-in `-x` / `--exclude` with regex | Requires negation logic or `! -name` |
 | **Parallel execution** | Built-in `-j N` / `--jobs N` | Requires `xargs -P` or GNU `parallel` |
+| **List-all mode** | Built-in `-l` / `--list-all` — run command once with all matches | Requires `xargs` or `+` terminator |
 | **Confirm mode** | Built-in `-c` / `--confirm` | Requires `-ok` (not universally supported) |
 | **Stop on error** | Built-in `-e` / `--stop-on-error` | No native support |
 | **Summary statistics** | Automatic (matched/run/failed counts) | No native support |

@@ -29,7 +29,7 @@ shell-cmd-rs [options] path "command %1 [%2 %3..]" regex [extra_args..]
 
 | Placeholder | Description |
 |-------------|-------------|
-| `%0` | Filename only (no path) |
+| `%0` | Filename only (no path); in `--list-all` mode, all matched paths joined by spaces |
 | `%1` | Full path to matched file |
 | `%2+` | Extra arguments from command line |
 | `%b` | Basename without extension (e.g., `report` from `report.txt`) |
@@ -42,6 +42,7 @@ shell-cmd-rs [options] path "command %1 [%2 %3..]" regex [extra_args..]
 | `-n` | `--dry-run` | Dry-run — print commands without executing |
 | `-v` | `--verbose` | Verbose — print each command before running |
 | `-a` | `--all` | Include hidden files and directories |
+| `-l` | `--list-all` | Collect all matches and run command once with `%0` = all matched paths |
 | `-d N` | `--depth N` | Max recursion depth (0 = current directory only) |
 | `-s SIZE` | `--size SIZE` | Filter by size: `+10M` (>10 MB), `-1K` (<1 KB), `4096` (exact). Suffixes: K, M, G |
 | `-m DAYS` | `--mtime DAYS` | Filter by modification time: `+7` (older than 7 days), `-1` (within last day) |
@@ -160,6 +161,18 @@ Stop on first error:
 shell-cmd-rs -e ./src "gcc -c %1 -o /tmp/%b.o" ".*\.c$"
 ```
 
+Collect all matches and pass them as a single argument list:
+
+```bash
+shell-cmd-rs -l . "cat %0" ".*\.txt$"
+```
+
+Dry-run list-all mode to preview the combined command:
+
+```bash
+shell-cmd-rs -l -n . "wc -l %0" ".*\.rs$"
+```
+
 ## How It Works
 
 The program recursively walks the specified directory using Rust's `std::fs`. For each file whose path matches the given regex (via the `regex` crate), it substitutes placeholders in the command template and executes it via `fork`/`execv` through the configured shell (`/bin/bash` by default). Hidden files and directories are skipped by default.
@@ -188,6 +201,7 @@ Command execution uses the `nix` crate for POSIX `fork`, `execv`, `waitpid`, and
 | **Filter by metadata** | Size, time, permissions, owner, group, type | Size, time, permissions, ownership, type, boolean logic |
 | **Exclude patterns** | Built-in `-x` with regex | Requires negation logic or `! -name` |
 | **Parallel execution** | Built-in `-j N` | Requires `xargs -P` or GNU `parallel` |
+| **List-all mode** | Built-in `-l` collects matches into single command | Requires `xargs` or `+` terminator |
 | **Confirm mode** | Built-in `-c` flag | Requires `-ok` (not universally supported) |
 | **Stop on error** | Built-in `-e` flag | No native support |
 | **Summary stats** | Automatic (matched/run/failed counts) | No native support |

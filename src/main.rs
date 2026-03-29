@@ -12,10 +12,13 @@
 //!
 //! - Regex-based file matching (via the `regex` crate)
 //! - Placeholder substitution: `%0` (filename), `%1` (full path), `%b` (stem),
-//!   `%e` (extension), `%2+` (extra args)
+//!   `%e` (extension), `%2+` (extra args); in `--list-all` mode `%0` expands to
+//!   all matched paths joined by spaces
 //! - Metadata filters: size, modification time, permissions, owner, group, type
 //! - Exclude patterns, dry-run, verbose, confirm mode, stop-on-error
 //! - Parallel execution via `fork`/`execv` with proper signal handling
+//! - List-all mode (`-l`/`--list-all`): collect all matches and run the command
+//!   once with `%0` expanded to the full list of matched paths
 //! - Summary statistics (matched/run/failed)
 //!
 //! ## Architecture
@@ -24,8 +27,10 @@
 //! 1. Parse CLI arguments via `clap` derive macros into [`Cli`]
 //! 2. Convert [`Cli`] into [`Options`] (runtime config)
 //! 3. Compile regex patterns
-//! 4. Call [`add_directory()`] to recursively walk the filesystem
-//! 5. For each match, call [`proc_cmd()`] to substitute placeholders and execute
+//! 4. In list-all mode (`-l`), call [`fill_list()`] to collect all matches into a
+//!    vector, then invoke [`proc_cmd()`] once with `%0` expanded to all paths
+//! 5. Otherwise, call [`add_directory()`] to recursively walk the filesystem
+//!    and call [`proc_cmd()`] per match to substitute placeholders and execute
 //! 6. In parallel mode, manage child PIDs via [`CHILD_PIDS`] and drain with [`wait_all()`]
 //! 7. Print summary to stderr
 //!
@@ -239,6 +244,10 @@ struct Cli {
     #[arg(short = 'c', long = "confirm")]
     confirm: bool,
 
+    /// Collect all matches and run command once with %0 = all matched paths
+    #[arg(short = 'l', long = "list-all")]
+    list_all: bool,
+
     /// Run N commands in parallel (default: 1)
     #[arg(short = 'j', long = "jobs", default_value = "1")]
     jobs: i32,
@@ -288,6 +297,9 @@ struct Options {
     /// Shell path to use for command execution (default: /bin/bash).
     shell: String,
     shell_name: String,
+    /// If true (via `-l`/`--list-all`), collect all matched file paths and run
+    /// one command with `%0` expanded to the combined space-delimited list.
+    collect_all: bool,
 }
 
 /// Parse a size filter string into a [`SizeFilter`].
@@ -692,10 +704,41 @@ fn system_cmd(command: &str, opts: &Options) -> i32 {
     status
 }
 
-/// Substitute placeholders and execute (or print in dry-run).
-fn proc_cmd(cmd: &str, text: &[String], opts: &Options, stats: &mut Stats) -> bool {
+/// Substitute placeholders in a command template and execute the result.
+///
+/// # Modes
+///
+/// - **Default mode** (one invocation per match): `%0` = basename, `%1` = full
+///   path, `%2+` = extra args, `%b` = stem, `%e` = extension.
+/// - **`--list-all` mode** (`-l`): all matching file paths are collected first
+///   by [`fill_list()`], joined into a single space-delimited string, and passed
+///   as `file_string`. In this mode `%0` is replaced with the entire list of
+///   matched paths rather than an individual filename.
+///
+/// Supports confirm mode, dry-run, parallel forking, and stop-on-error.
+///
+/// # Arguments
+///
+/// - `cmd` — the command template string containing `%` placeholders
+/// - `text` — slice of strings: `text[0]` is the matched file path (unused in
+///   list-all mode), `text[1+]` are extra CLI arguments
+/// - `file_string` — when `--list-all` is active, the space-joined list of all
+///   matched paths; `None` in default per-file mode
+/// - `opts` — runtime options
+/// - `stats` — mutable execution statistics
+///
+/// # Returns
+///
+/// `true` to continue processing, `false` to stop (stop-on-error triggered).
+fn proc_cmd(
+    cmd: &str,
+    text: &[String],
+    file_string: Option<&str>,
+    opts: &Options,
+    stats: &mut Stats,
+) -> bool {
     let mut r = cmd.to_string();
-    if !text.is_empty() {
+    if file_string.is_none() && !text.is_empty() {
         let fpath = Path::new(&text[0]);
         let fname = fpath
             .file_name()
@@ -713,12 +756,25 @@ fn proc_cmd(cmd: &str, text: &[String], opts: &Options, stats: &mut Stats) -> bo
         r = replace_all(&r, "%b", &stem);
         r = replace_all(&r, "%e", &ext);
     }
-    for (i, val) in text.iter().enumerate() {
-        let placeholder = format!("%{}", i + 1);
-        if i == 0 && val.contains(' ') {
-            r = replace_all(&r, &placeholder, &format!("\"{}\"", val));
-        } else {
-            r = replace_all(&r, &placeholder, val);
+    if let Some(fs) = file_string {
+        // --list-all mode: %0 expands to the full list of matched paths
+        r = replace_all(&r, "%0", fs);
+        for (i, val) in text.iter().enumerate() {
+            let placeholder = format!("%{}", i + 1);
+            if val.contains(' ') {
+                r = replace_all(&r, &placeholder, &format!("\"{}\"", val));
+            } else {
+                r = replace_all(&r, &placeholder, val);
+            }
+        }
+    } else {
+        for (i, val) in text.iter().enumerate() {
+            let placeholder = format!("%{}", i + 1);
+            if i == 0 && val.contains(' ') {
+                r = replace_all(&r, &placeholder, &format!("\"{}\"", val));
+            } else {
+                r = replace_all(&r, &placeholder, val);
+            }
         }
     }
 
@@ -852,6 +908,120 @@ fn wait_all(stats: &mut Stats) {
     }
 }
 
+/// Recursively walk a directory and collect all matching file paths into `files`.
+///
+/// This is the list-all counterpart to [`add_directory()`]. Instead of executing
+/// a command for each match, it appends the full path of every matched entry to
+/// the `files` vector. The caller then joins these paths and invokes the command
+/// template once via [`proc_cmd()`] with `%0` expanded to the entire list.
+///
+/// # Arguments
+///
+/// - `path` — the directory to scan
+/// - `regex` — compiled regex matched against each entry's full path
+/// - `exclude_regex` — optional compiled exclude pattern
+/// - `opts` — runtime options (depth, hidden, filters, etc.)
+/// - `stats` — mutable execution statistics (files_matched is incremented)
+/// - `files` — accumulator for matched file paths
+/// - `depth` — current recursion depth (0 at the root call)
+fn fill_list(
+    path: &Path,
+    regex: &Regex,
+    exclude_regex: Option<&Regex>,
+    opts: &Options,
+    stats: &mut Stats,
+    files: &mut Vec<String>,
+    depth: i32,
+) {
+    if opts.max_depth >= 0 && depth > opts.max_depth {
+        return;
+    }
+    if STOP_REQUESTED.load(Ordering::SeqCst) || INTERRUPTED.load(Ordering::SeqCst) {
+        return;
+    }
+
+    let entries = match fs::read_dir(path) {
+        Ok(e) => e,
+        Err(e) => {
+            error!("could not open directory: {}: {}", path.display(), e);
+            process::exit(1);
+        }
+    };
+
+    for entry in entries {
+        if STOP_REQUESTED.load(Ordering::SeqCst) || INTERRUPTED.load(Ordering::SeqCst) {
+            return;
+        }
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        let filename = entry.file_name().to_string_lossy().to_string();
+
+        // Skip hidden files unless --all
+        if !opts.hidden && filename.starts_with('.') {
+            continue;
+        }
+
+        // Exclude pattern check
+        if let Some(excl) = exclude_regex {
+            if excl.is_match(&filename) {
+                continue;
+            }
+        }
+
+        let symlink_meta = match entry.path().symlink_metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let is_symlink = symlink_meta.file_type().is_symlink();
+        let meta = if is_symlink && opts.type_filter != 'l' {
+            match entry.path().metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            }
+        } else {
+            symlink_meta.clone()
+        };
+
+        let is_dir = meta.is_dir();
+        let is_file = meta.is_file();
+
+        if is_dir && !is_symlink {
+            if opts.type_filter == 'd' {
+                let fullpath = entry.path().to_string_lossy().to_string();
+                if regex.is_match(&fullpath) && matches_filters(&entry.path(), &meta, opts) {
+                    stats.files_matched += 1;
+                    files.push(fullpath);
+                }
+            }
+            fill_list(
+                &entry.path(),
+                regex,
+                exclude_regex,
+                opts,
+                stats,
+                files,
+                depth + 1,
+            );
+        } else if is_symlink && opts.type_filter == 'l' {
+            let fullpath = entry.path().to_string_lossy().to_string();
+            if regex.is_match(&fullpath) && matches_filters(&entry.path(), &symlink_meta, opts) {
+                stats.files_matched += 1;
+                files.push(fullpath);
+            }
+        } else if is_file || (is_symlink && opts.type_filter == '\0') {
+            let fullpath = entry.path().to_string_lossy().to_string();
+            if regex.is_match(&fullpath) && matches_filters(&entry.path(), &meta, opts) {
+                stats.files_matched += 1;
+                files.push(fullpath);
+            }
+        }
+    }
+}
+
 fn add_directory(
     path: &Path,
     cmd: &str,
@@ -938,7 +1108,7 @@ fn add_directory(
                 if regex.is_match(&fullpath) && matches_filters(&entry.path(), &meta, opts) {
                     stats.files_matched += 1;
                     args[0] = fullpath;
-                    if !proc_cmd(cmd, args, opts, stats) {
+                    if !proc_cmd(cmd, args, None, opts, stats) {
                         return;
                     }
                 }
@@ -958,7 +1128,7 @@ fn add_directory(
             if regex.is_match(&fullpath) && matches_filters(&entry.path(), &symlink_meta, opts) {
                 stats.files_matched += 1;
                 args[0] = fullpath;
-                if !proc_cmd(cmd, args, opts, stats) {
+                if !proc_cmd(cmd, args, None, opts, stats) {
                     return;
                 }
             }
@@ -967,7 +1137,7 @@ fn add_directory(
             if regex.is_match(&fullpath) && matches_filters(&entry.path(), &meta, opts) {
                 stats.files_matched += 1;
                 args[0] = fullpath;
-                if !proc_cmd(cmd, args, opts, stats) {
+                if !proc_cmd(cmd, args, None, opts, stats) {
                     return;
                 }
             }
@@ -984,8 +1154,9 @@ extern "C" fn sigint_handler(_sig: libc::c_int) {
 ///
 /// Parses command-line arguments via `clap`, validates positional arguments
 /// and placeholder consistency, constructs [`Options`], compiles regex patterns,
-/// runs the recursive directory traversal via [`add_directory()`], waits for
-/// parallel children if applicable, and prints a summary.
+/// runs the recursive directory traversal via [`add_directory()`] (or
+/// [`fill_list()`] in `--list-all` mode), waits for parallel children if
+/// applicable, and prints a summary.
 ///
 /// # Exit codes
 ///
@@ -1014,16 +1185,19 @@ fn print_help() {
 {bc}(Rust implementation of shell-cmd){r}
 
 {by}placeholders:{r}
-  {g}%0{r}          filename only (no path)
+  {g}%0{r}          filename only (no path, per-match mode)
   {g}%1{r}          full path to matched file
   {g}%2+{r}         extra arguments from command line
   {g}%b{r}          basename without extension
   {g}%e{r}          file extension (including dot)
 
+  (with -l/--list-all) %0 expands to all matched paths joined by spaces
+
 {by}options:{r}
   {g}-n, --dry-run{r}       dry-run, print commands without executing
   {g}-v, --verbose{r}       verbose, print each command before running
   {g}-a, --all{r}           include hidden files/directories
+  {g}-l, --list-all{r}      collect all matches and invoke command once with %0=all-matches
   {g}-d, --depth N{r}       max recursion depth (0 = current dir only)
   {g}-s, --size SIZE{r}     filter by size: +10M (>10MB), -1K (<1KB),
                       4096 (exactly 4096 bytes). Suffixes: K, M, G
@@ -1116,6 +1290,7 @@ fn main() {
             .unwrap_or(&cli.shell)
             .to_string(),
         shell: cli.shell,
+        collect_all: cli.list_all,
     };
 
     let positional = &cli.args;
@@ -1143,8 +1318,14 @@ fn main() {
         None
     };
 
-    let mut index: usize = 2;
-    let mut args: Vec<String> = vec!["filename".to_string()];
+    // In --list-all mode, the placeholder index starts at 1 (no per-file %1)
+    // and args does not include a "filename" placeholder entry.
+    let mut index: usize = if opts.collect_all { 1 } else { 2 };
+    let mut args: Vec<String> = if opts.collect_all {
+        Vec::new()
+    } else {
+        vec!["filename".to_string()]
+    };
     for i in 3..positional.len() {
         let placeholder = format!("%{}", index);
         if !input.contains(&placeholder) {
@@ -1163,6 +1344,31 @@ fn main() {
         commands_run: 0,
         commands_failed: 0,
     };
+
+    if opts.collect_all {
+        // --list-all mode: collect all matching paths, then run the command once
+        // with %0 expanded to the space-joined list of all matches.
+        let mut files: Vec<String> = Vec::new();
+        fill_list(
+            &path,
+            &regex,
+            exclude_regex.as_ref(),
+            &opts,
+            &mut stats,
+            &mut files,
+            0,
+        );
+        let all_files = files.join(" ");
+        if proc_cmd(input, &args, Some(&all_files), &opts, &mut stats) {
+            if opts.verbose {
+                println!("Success command file list: {} .", all_files);
+            }
+            process::exit(0);
+        } else {
+            println!("List all command failed.");
+            process::exit(1);
+        }
+    }
 
     add_directory(
         &path,
