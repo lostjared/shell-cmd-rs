@@ -1414,7 +1414,7 @@ fn fill_list(
         let is_dir = meta.is_dir();
         let is_file = meta.is_file();
 
-        if is_dir && !is_symlink {
+        if is_dir {
             if opts.type_filter == 'd' {
                 let fullpath = entry.path().to_string_lossy().to_string();
                 if entry_matches_path(&fullpath, regex, expr_root) && matches_filters(&entry.path(), &meta, opts) {
@@ -1528,7 +1528,7 @@ fn add_directory(
         //   active, they are also tested against the regex for matching.
         // - Symlinks with --type l are tested against the regex.
         // - Regular files (and unfiltered symlinks) are tested against the regex.
-        if is_dir && !is_symlink {
+        if is_dir {
             // If type filter is 'd', also match directories against regex
             if opts.type_filter == 'd' {
                 let fullpath = entry.path().to_string_lossy().to_string();
